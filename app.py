@@ -18,48 +18,116 @@ Attributes = {
     "Attribute 4": {"x1": 12.43, "x2": 9.1, "x3": 15.7,"x4":17.23,"x5":8.05,"x6":11.5,"x7":14.3,"x8":5.9,"x9":11.6,"x10":7.5,"x11":15.1,"x12":10.1,"x13":9.97,"x14":0},
     "Attribute 5": {"x1": 140, "x2": 93, "x3": 97.3,"x4":100,"x5":77.5,"x6":115,"x7":156,"x8":121,"x9":115,"x10":101,"x11":92,"x12":101,"x13":94,"x14":0}
 }
+default_specs = {
+    "Attribute 1": (50, 150, 100),
+    "Attribute 2": (100, 120, 110),
+    "Attribute 3": (0, 1000, 75),
+    "Attribute 4": (0, 5, 10),
+    "Attribute 5": (98, 100, 98),
+}
 
+if "lots_data" not in st.session_state:
+    st.session_state.lots_data = pd.DataFrame([
+        {"Lot": lot, "Cost": Cost[lot], "Capacity": bounds[lot]}
+        for lot in bounds
+    ])
+
+if "specs_data" not in st.session_state:
+    st.session_state.specs_data = pd.DataFrame([
+        {
+            "Attribute": attr,
+            "Min": limits[0],
+            "Max": limits[1],
+            "Target": limits[2],
+        }
+        for attr, limits in default_specs.items()
+    ])
+
+if "values_data" not in st.session_state:
+    st.session_state.values_data = pd.DataFrame([
+        {"Attribute": attr, "Lot": lot, "Value": value}
+        for attr, lot_values in Attributes.items()
+        for lot, value in lot_values.items()
+    ])
 # --- ⚙️ LINEAR PROGRAMMING SOLVER CORE ---
-def solve_for_lambda(lmbda, total_units_required, Specs):
-    x = {i: pl.LpVariable(i, lowBound=0, upBound=bounds[i]) for i in bounds}
-    prob = pl.LpProblem("Blend_Quality_Cost", pl.LpMinimize)
-    total_units = sum(x.values())
-    prob += total_units == total_units_required
-    
-    deviation_vars = {}
-    for attr, values in Attributes.items():
-        pos = pl.LpVariable(f"{attr}_pos", lowBound=0)
-        neg = pl.LpVariable(f"{attr}_neg", lowBound=0)
-        deviation_vars[attr] = (pos, neg)
-        
-        min_val, max_val, target = Specs[attr]
-        total_attr = sum(values[i] * x[i] for i in x)
-        prob += total_attr >= min_val * total_units
-        prob += total_attr <= max_val * total_units
-        prob += total_attr - target * total_units == pos - neg
-        
-    total_cost = sum(Cost[i] * x[i] for i in x)
-    total_dev = sum(pos + neg for pos, neg in deviation_vars.values())
-    prob += total_cost + lmbda * total_dev
-    
-    prob.solve(pl.PULP_CBC_CMD(msg=False))
-    
-    xv = {i: x[i].value() for i in x}
-    cost_val = sum(Cost[i] * xv[i] for i in xv)
-    dev_val = sum(pos.value() + neg.value() for pos, neg in deviation_vars.values())
-    
-    results = {
-        "cost": cost_val,
-        "deviation": dev_val,
-        "status": LpStatus[prob.status],
-        "allocations": xv
+def solve_for_lambda(lmbda, total_units_required, lots_df, specs_df, values_df):
+    lots = lots_df.set_index("Lot").to_dict("index")
+    specs = specs_df.set_index("Attribute").to_dict("index")
+    values = {
+        (row["Attribute"], row["Lot"]): row["Value"]
+        for _, row in values_df.iterrows()
     }
-    
-    total_units_val = sum(xv.values())
-    for attr, values in Attributes.items():
-        results[attr] = (
-            sum(values[i] * xv[i] for i in xv) / total_units_val if total_units_val else None
+
+    lot_names = list(lots)
+    attr_names = list(specs)
+
+    x = {
+        lot: pl.LpVariable(
+            f"lot_{index}",
+            lowBound=0,
+            upBound=float(lots[lot]["Capacity"]),
         )
+        for index, lot in enumerate(lot_names)
+    }
+
+    prob = pl.LpProblem("Blend_Quality_Cost", pl.LpMinimize)
+    total_units = pl.lpSum(x.values())
+    prob += total_units == total_units_required
+
+    deviation_vars = {}
+    for index, attr in enumerate(attr_names):
+        pos = pl.LpVariable(f"attr_{index}_pos", lowBound=0)
+        neg = pl.LpVariable(f"attr_{index}_neg", lowBound=0)
+        deviation_vars[attr] = (pos, neg)
+
+        spec = specs[attr]
+        total_attr = pl.lpSum(
+            values[(attr, lot)] * x[lot] for lot in lot_names
+        )
+
+        prob += total_attr >= spec["Min"] * total_units
+        prob += total_attr <= spec["Max"] * total_units
+        prob += total_attr - spec["Target"] * total_units == pos - neg
+
+    total_cost = pl.lpSum(
+        lots[lot]["Cost"] * x[lot] for lot in lot_names
+    )
+    total_deviation = pl.lpSum(
+        pos + neg for pos, neg in deviation_vars.values()
+    )
+    prob += total_cost + lmbda * total_deviation
+
+    prob.solve(pl.PULP_CBC_CMD(msg=False))
+    status = LpStatus[prob.status]
+
+    if status != "Optimal":
+        return {"status": status}
+
+    allocations = {lot: x[lot].value() for lot in lot_names}
+    total_units_value = sum(allocations.values())
+
+    results = {
+        "status": status,
+        "cost": sum(
+            lots[lot]["Cost"] * allocations[lot] for lot in lot_names
+        ),
+        "deviation": sum(
+            pos.value() + neg.value()
+            for pos, neg in deviation_vars.values()
+        ),
+        "allocations": allocations,
+    }
+
+    for attr in attr_names:
+        results[attr] = (
+            sum(
+                values[(attr, lot)] * allocations[lot]
+                for lot in lot_names
+            ) / total_units_value
+            if total_units_value
+            else None
+        )
+
     return results
 
 # --- 🛠️ INTERACTIVE SIDEBAR CONTROLS ---
@@ -73,78 +141,126 @@ with st.sidebar:
         "Select Penalty Weight (λ)", min_value=0, max_value=5000, value=100, step=10
     )
     st.divider()
-    
-    st.header("📋 Quality Spec Thresholds")
-    Specs = {}
-    default_specs = {
-        "Attribute 1": (50, 150, 100),
-        "Attribute 2": (100, 120, 110),
-        "Attribute 3": (0, 1000, 75),
-        "Attribute 4": (0, 5, 10),
-        "Attribute 5": (98, 100, 98)
-    }
-    
-    for attr, (default_min, default_max, target) in default_specs.items():
-        st.markdown(f"**{attr} Settings**")
-        min_val, max_val = st.slider(
-            f"Allowed Range for {attr}", min_value=0, max_value=max(default_max * 2, 100), value=(default_min, default_max), key=f"slider_{attr}"
-        )
-        Specs[attr] = (min_val, max_val, target)
-        
-    st.divider()
-    # Placing the button at the baseline level of the sidebar guarantees visibility
-    submit_button = st.button(label="⚡ Create Optimized Blend", use_container_width=True, type="primary")
 
+    submit_button = st.button(
+        label="⚡ Create Optimized Blend",
+        use_container_width=True,
+        type="primary",
+    )
+st.subheader("Resource lots")
+lots_df = st.data_editor(
+    st.session_state.lots_data,
+    num_rows="dynamic",
+    key="lots_editor",
+    column_config={
+        "Lot": st.column_config.TextColumn("Lot name", required=True),
+        "Cost": st.column_config.NumberColumn("Cost", min_value=0, required=True),
+        "Capacity": st.column_config.NumberColumn("Capacity", min_value=0, required=True),
+    },
+    use_container_width=True,
+)
+
+st.subheader("Attribute specifications")
+specs_df = st.data_editor(
+    st.session_state.specs_data,
+    num_rows="dynamic",
+    key="specs_editor",
+    column_config={
+        "Attribute": st.column_config.TextColumn("Attribute name", required=True),
+        "Min": st.column_config.NumberColumn("Minimum", required=True),
+        "Max": st.column_config.NumberColumn("Maximum", required=True),
+        "Target": st.column_config.NumberColumn("Target", required=True),
+    },
+    use_container_width=True,
+)
+
+st.subheader("Attribute values for each lot")
+values_df = st.data_editor(
+    st.session_state.values_data,
+    num_rows="dynamic",
+    key="values_editor",
+    column_config={
+        "Attribute": st.column_config.TextColumn("Attribute name", required=True),
+        "Lot": st.column_config.TextColumn("Lot name", required=True),
+        "Value": st.column_config.NumberColumn("Value", required=True),
+    },
+    use_container_width=True,
+)
 # --- 📊 VISUAL DASHBOARD GENERATION ---
 if submit_button:
-    result = solve_for_lambda(lmbda, total_units_required, Specs)
-    
-    # 1. Summary Cards
-    c1, c2, c3 = st.columns(3)
-    with c1:
-        if result["status"] == "Optimal":
+    result = solve_for_lambda(
+        lmbda,
+        total_units_required,
+        lots_df,
+        specs_df,
+        values_df,
+    )
+
+    if result["status"] != "Optimal":
+        st.error(f"Solver Status: {result['status']}")
+    else:
+        c1, c2, c3 = st.columns(3)
+        with c1:
             st.success(f"Solver Status: {result['status']}")
-        else:
-            st.error(f"Solver Status: {result['status']}")
-    with c2:
-        st.metric("Calculated Total Cost", f"${result['cost']:,.2f}")
-    with c3:
-        st.metric("Total Quality Deviation", f"{result['deviation']:.2f}")
-        
-    st.divider()
-    
-    # 2. Main content panels
-    left_panel, right_panel = st.columns(2)
-    with left_panel:
-        st.subheader("📈 Realized Quality Attribute Metrics")
-        infeasible_attrs = []
-        for attr, (min_val, max_val, target) in Specs.items():
-            avg_val = result[attr]
-            with st.container(border=True):
-                st.markdown(f"**{attr}** (Target: {target} | Allowed: [{min_val} - {max_val}])")
-                if avg_val is not None:
+        with c2:
+            st.metric("Calculated Total Cost", f"${result['cost']:,.2f}")
+        with c3:
+            st.metric("Total Quality Deviation", f"{result['deviation']:.2f}")
+
+        st.divider()
+
+        left_panel, right_panel = st.columns(2)
+
+        with left_panel:
+            st.subheader("📈 Realized Quality Attribute Metrics")
+            infeasible_attrs = []
+
+            for _, spec in specs_df.iterrows():
+                attr = spec["Attribute"]
+                min_val = spec["Min"]
+                max_val = spec["Max"]
+                target = spec["Target"]
+                avg_val = result[attr]
+
+                with st.container(border=True):
+                    st.markdown(
+                        f"**{attr}** (Target: {target} | "
+                        f"Allowed: [{min_val} - {max_val}])"
+                    )
                     if avg_val < min_val or avg_val > max_val:
-                        st.markdown(f"Realized Blend: :red[{avg_val:.2f} ⚠️ Out of Spec!]")
+                        st.markdown(
+                            f"Realized Blend: :red[{avg_val:.2f} ⚠️ Out of Spec!]"
+                        )
                         infeasible_attrs.append(attr)
                     else:
-                        st.markdown(f"Realized Blend: :green[{avg_val:.2f} ✅ Within Range]")
-                else:
-                    st.markdown("Realized Blend: :red[N/A (Infeasible Solution)]")
-                    infeasible_attrs.append(attr)
-                    
-        if infeasible_attrs:
-            st.warning(f"💡 System Alert: Parameters are physically **infeasible** for: {', '.join(infeasible_attrs)}.")
-        else:
-            st.info("✅ Ideal Blend Achieved: All operational specs satisfied.")
-            
-    with right_panel:
-        st.subheader("📦 Resource Lot Allocation Matrix")
-        df_alloc = pd.DataFrame({
-            "Lot Number": list(result["allocations"].keys()),
-            "Allocated Volume": list(result["allocations"].values()),
-            "Capacity Ceiling": [bounds[lot] for lot in result["allocations"].keys()]
-        })
-        st.dataframe(df_alloc, hide_index=True, use_container_width=True)
-        st.bar_chart(data=df_alloc, x="Lot Number", y="Allocated Volume")
+                        st.markdown(
+                            f"Realized Blend: :green[{avg_val:.2f} ✅ Within Range]"
+                        )
+
+            if infeasible_attrs:
+                st.warning(
+                    "💡 System Alert: Parameters are physically **infeasible** "
+                    f"for: {', '.join(infeasible_attrs)}."
+                )
+            else:
+                st.info("✅ Ideal Blend Achieved: All operational specs satisfied.")
+
+        with right_panel:
+            st.subheader("📦 Resource Lot Allocation Matrix")
+            capacities = lots_df.set_index("Lot")["Capacity"]
+
+            df_alloc = pd.DataFrame({
+                "Lot Number": list(result["allocations"].keys()),
+                "Allocated Volume": list(result["allocations"].values()),
+                "Capacity Ceiling": [
+                    capacities[lot] for lot in result["allocations"]
+                ],
+            })
+            st.dataframe(df_alloc, hide_index=True, use_container_width=True)
+            st.bar_chart(data=df_alloc, x="Lot Number", y="Allocated Volume")
 else:
-    st.info("👈 Set your engineering constraints in the sidebar and click **'Create Optimized Blend'** to calculate results.")
+    st.info(
+        "👈 Set your engineering constraints in the sidebar and click "
+        "**'Create Optimized Blend'** to calculate results."
+    )
+
