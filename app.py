@@ -4,7 +4,7 @@ from pulp import LpStatus
 import pandas as pd
 
 # --- 🔐 NATIVE IDENTITY ROUTING BLOCK ---
-if not st.user.is_logged_in:
+if not st.user.is_logged_in():
     # --------------------------------------------------------------------------
     # 🛑 STATE A: ANONYMOUS PORTAL ENTRY
     # --------------------------------------------------------------------------
