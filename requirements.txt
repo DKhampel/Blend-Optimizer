@@ -3,3 +3,4 @@ pandas
 pulp
 st-login-form
 supabase
+streamlit[auth]
